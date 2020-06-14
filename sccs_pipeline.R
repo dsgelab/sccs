@@ -1,24 +1,114 @@
-
+setwd("/home/jsjukara/")
+library(data.table) # for using fread
 library(tidyverse)
 library(SCCS)
+library(lubridate) # for manipulating dates
+library(tictoc)
 
+# load workspace which contains "events" and "purchases" data frames from preprocessing step
+load("sccs_workspace.RData")
+
+## Define endpoints and ATC-codes for different rounds of analyses
+
+# function to go from a vector into string, e.g. c("A", "B") becomes string "A|B"
+vec2sep <- function(x, sep="|") {
+    return(paste(x, collapse=sep))
+}
+
+
+# function that reverses the above
+sep2vec <- function(x, sep="|") {
+    return(unlist(strsplit(x, split="\\|")))
+}
+
+bleed_endpoints <- c("D3_HAEMORRHAGCIRGUANTICO", #Haemorrhagic disorder due to circulating anticoagulants
+                    "H7_CONJUHAEMOR", #conjunctival haemorrhage
+                    "H7_RETINAHAEMORR", #Retinal haemorrhage
+                    "H7_VITRHAEMORR", #Vitreous haemorrhage
+                    "I9_INTRACRA", #Nontraumatic intracranial haemmorrhage: I9_SAH|I9_ICH
+                     "I9_OTHINTRACRA", #Other intracranial haemorrhages
+                     "ST19_EPIDU_HAEMORRHAGE", #Epidural haemorrhage
+                    "ST19_TRAUMAT_SUBDU_HAEMORRHAGE", #Traumatic subdural haemorrhage
+                    "ST19_TRAUMAT_SUBAR_HAEMORRHAGE", #Traumatic subarachnoid haemorrhage
+                    "R18_HAEMORRHAGE_RESPI_PASSA") #Haemorrhage from respiratory passages
+
+myopathy_endpoints <- c("G6_DRUGMYOP", #only 43 cases
+                        "M13_MYALGIA")
+
+cvd_endpoints <- c("I9_MI", # Myocardial infarction
+               "I9_STR_EXH") # Stroke, excluding SAH
+
+bzd_endpoints <- c("ST19_FRACT_FEMUR", # Hip fractures
+                   "ST19_FRACT_WRIST_HAND_LEVEL", # Wrist/hand fractures
+                   "FALLS", # Falls/tendency to fall
+                   "VWXY20_UNSPE_FALL",
+                   "VWXY20_TRANSPO_ACCIDENTS" # Transport accidents
+                  )
+
+opioid_endpoints <- c("K11_CONSTIPATION")
+
+agranulocytosis_endpoints <- c("D3_AGRANULOCYTOSIS")
+
+osteoporosis_endpoints <- c("M13_OSTEOPOROSIS",
+                           "ST19_FRACT_RIBS_STERNUM_THORACIC_SPINE",
+                           "ST19_FRACT_LUMBAR_SPINE_PELVIS",
+                           "ST19_FRACT_SHOUL_UPPER_ARM",
+                           "ST19_FRACT_FOREA",
+                           "ST19_FRACT_WRIST_HAND_LEVEL",
+                           "ST19_FRACT_LOWER_LEG_INCLU_ANKLE",
+                           "ST19_FRACT_SPINE_LEVEL_UNSPE")
+
+clot_endpoints <- c("I9_DVTANDPULM") # DVT and PE
+
+atc_endpoint_map <- data.frame(drug_group = c('ssri',
+                                     'statin',
+                                     "cox-2 inhibitor",
+                                     "benzodiazepine",
+                                     "opioid",
+                                     "antiepileptics/clozapine",
+                                     "glucocorticoids & antiepileptics",
+                                     "estrogen"),
+                      atc_codes = c('N06AB',
+                                    'C10AA',
+                                    'M01AH',
+                                    'N05BA',
+                                    'N02A',
+                                    'N03A|N05AH02',
+                                    'H02AB|N03AB02|N03AF01',
+                                    'G03C'),
+                      endpoints = c(vec2sep(bleed_endpoints),
+                                   vec2sep(myopathy_endpoints),
+                                   vec2sep(cvd_endpoints),
+                                   vec2sep(bzd_endpoints),
+                                   vec2sep(opioid_endpoints),
+                                   vec2sep(agranulocytosis_endpoints),
+                                   vec2sep(osteoporosis_endpoints),
+                                   vec2sep(clot_endpoints)),
+                              stringsAsFactors=FALSE)
 
 # endpoint_combination returns events included in vector "endpoints"
 # events     : data frame of all recorded events (FINNGENID, EVENT_AGE, ENDPOINT)
 # endpoints  : vector of FinnGen endpoint names to be studied
 endpoint_combination <- function(events, endpoints) {
-  
-  # calculate observation start age
-  # TODO: replace with correct years
-  events$OBSERV_START_AGE <- events$FU_END_AGE - (2018-1995)
-  
-  # sort events by finngenid and event age
-  events <- arrange(events, FINNGENID, EVENT_AGE)
-  
-  # filter events by "endpoints" vector
-  events <- events[events$ENDPOINT %in% endpoints,]
-  
-  return(events)
+    
+    # modify | separated endpoints to vector
+    endpoints <- sep2vec(endpoints)
+    
+    # calculate observation start age
+    events$OBSERV_START_AGE <- events$FU_START_AGE
+
+    # sort events by finngenid and event age
+    events <- arrange(events, FINNGENID, EVENT_AGE)
+
+    # filter events by "endpoints" vector
+    events <- events[events$ENDPOINT %in% endpoints,]
+    
+    if (nrow(events)==0) {
+        print("Zero rows for endpoint ", endpoint, ", aborting")
+        return(NA)
+    }
+
+    return(events)
 }
 
 
@@ -32,41 +122,48 @@ endpoint_combination <- function(events, endpoints) {
 # psize        : default package size (in days)
 exposure_combination <- function(purchases, atc_codes, vnr_info,
                                  tolerance=14, ignore_psize=FALSE, psize=100) {
-  
-  # filter purchases by relevant atc codes
-  purchases <- purchases[purchases$ATC_CODE %in% atc_codes$ATC_CODE,]
-  
-  # if given actual package sizes, use them
-  if (!ignore_psize) {
+    
+    # filter purchases by relevant atc codes
+    # returns all purchases with any of atc_codes$ATC_CODE at the beginning
+    pattern <- paste("^", paste(atc_codes$ATC_CODE, collapse="|^"), sep="")
+    purchases <- filter(purchases, grepl(pattern, ATC_CODE))
+    
+    if (nrow(purchases)==0) {
+        print("Zero rows for ATCs ", pattern, ", aborting")
+        return(NA)
+    }
+
+    # if given actual package sizes, use them
+    if (!ignore_psize) {
     # combine purchases with package info
     purchases <- left_join(purchases, vnr_info, by="VNRO")
-    
+
     # check if all VNRs were found
     if (any(is.na(purchases$PKOKO))) {
       print("VNRs not found:")
       print(unique(purchases[is.na(purchases$PKOKO),]$VNRO))
       stop()
     }
-    
+    print(head(purchases))
     # calculate exposure duration and exposure end age using doses per day
     purchases <- left_join(purchases, atc_codes, by="ATC_CODE")
     purchases$EXPOSURE_END_AGE <- purchases$PURCHASE_AGE +
       with(purchases, PLKM * PKOKO / 365 / DAILY_DOSE)
-    
-  # otherwise, assume default package size
-  } else {
+
+    # otherwise, assume default package size
+    } else {
     purchases$EXPOSURE_END_AGE <- purchases$PURCHASE_AGE + psize/365
-  }
-  
-  # sort purchases by finngenid and purchase age
-  purchases <- arrange(purchases, FINNGENID, PURCHASE_AGE)
-  
-  # initialize episode number
-  purchases$EPISODE <- NA
-  purchases[1,]$EPISODE <- 1
-  
-  # loop over purchases and combine with previous purchase if within tolerance
-  for (row in 2:nrow(purchases)) {
+    }
+
+    # sort purchases by finngenid and purchase age
+    purchases <- arrange(purchases, FINNGENID, PURCHASE_AGE)
+
+    # initialize episode number
+    purchases$EPISODE <- NA
+    purchases[1,]$EPISODE <- 1
+
+    # loop over purchases and combine with previous purchase if within tolerance
+    for (row in 2:nrow(purchases)) {
     # if same finngenid as previous:
     if (purchases[row,]$FINNGENID == purchases[row-1,]$FINNGENID) {
       # if the next purchase made within tolerance:
@@ -87,22 +184,22 @@ exposure_combination <- function(purchases, atc_codes, vnr_info,
     }
     # if not the same finngenid or purchase not made within tolerance, increment episode number
     purchases[row,]$EPISODE <- purchases[row-1,]$EPISODE + 1
-  }
-  
-  # leave first purchase of episode
-  combined_purchases <- purchases %>% distinct(EPISODE, .keep_all = TRUE)
-  
-  # combined exposure end age <- end age of last exposure
-  combined_purchases$EXPOSURE_END_AGE <- purchases %>%
+    }
+
+    # leave first purchase of episode
+    combined_purchases <- purchases %>% distinct(EPISODE, .keep_all = TRUE)
+
+    # combined exposure end age <- end age of last exposure
+    combined_purchases$EXPOSURE_END_AGE <- purchases %>%
     group_by(EPISODE) %>%
     summarize(end = max(EXPOSURE_END_AGE)) %>%
     pull(end)
-  
-  # plkm and pkoko no longer relevant
-  combined_purchases <- subset(combined_purchases, select = c(FINNGENID, ATC_CODE, VNRO,
+
+    # plkm and pkoko no longer relevant
+    combined_purchases <- subset(combined_purchases, select = c(FINNGENID, ATC_CODE, VNRO,
                                                     PURCHASE_AGE, EXPOSURE_END_AGE))
-  
-  return(combined_purchases)
+
+    return(combined_purchases)
 }
 
 
@@ -123,6 +220,7 @@ sccs_model <- function(events, exposures, exposure_periods, age_groups,
   if (first_event) {
     events <- distinct(events, FINNGENID, .keep_all = TRUE)
   }
+    print(head(exposures))
   
   # combine event and exposure data
   # if an individual can have multiple events, all exposure episodes are repeated for each event
@@ -138,89 +236,22 @@ sccs_model <- function(events, exposures, exposure_periods, age_groups,
   data <- data %>%
     mutate_at(vars(EVENT_AGE, FU_END_AGE, OBSERV_START_AGE, PURCHASE_AGE,
                    EXPOSURE_END_AGE), .funs = funs(round(. * 365)))
+    
+    #data$OBSERV_START_AGE <- ifelse(data$OBSERV_START_AGE<0, 0, data$OBSERV_START_AGE)
   
   # create equally populated age groups, number specified in age_groups
   ageq <- floor(quantile(data$EVENT_AGE[duplicated(data$FINNGENID)==0],
                        seq(1/age_groups, 1-1/age_groups, 1/age_groups),names=F))
-  
+  print(head(data))
+    print(summary(data))
+    print(names(data))
+    print(object.size(data))
   # SCCS model fitting
-  data$ref <- round(age_groups/2) # for passing reference age to function
-  sccs.mod <- standardsccs(event~PURCHASE_AGE+relevel(age, ref=ref[1]),
+  #ref1 <- round(age_groups/2) # for passing reference age to function
+  sccs.mod <- standardsccs(event~PURCHASE_AGE+relevel(age, ref=5),
                              indiv=FINNGENID, astart=OBSERV_START_AGE, aend=FU_END_AGE,
                              aevent=EVENT_AGE, adrug=PURCHASE_AGE, aedrug=EXPOSURE_END_AGE,
                              expogrp=exposure_periods, agegrp=ageq, dataformat="stack", data=data)
   
   return(sccs.mod)
 }
-
-
-
-# Manual work needed
-# - diagnosis codes to vector "endpoints"
-# - ATC codes and daily doses to dataframe "atc_codes"
-# - choose exposure periods (standard is 0; if event-dependent exposure is suspected
-# then add pre-exposure period e.g. c(-7, 0), not longer than tolerance)
-# - choose number of age groups (could do hist(events$EVENT_AGE) first and play with
-# the number of breaks so that most trends are accounted for but the division is not
-# too fine to cause overfitting)
-# - include_unexposed: usually TRUE, improves estimation of age effects
-# - first_event: choose only first event or all events by individual
-# - test differences in models with lrtsccs(model2, model1)
-
-
-# read full event data, assign arguments and prepare relevant event data
-events <- read.csv("mock_longitudinal_endpoint_data.txt", header=TRUE)
-events$FU_END_AGE <- events$EVENT_AGE + 1 # this column was missing
-endpoints <- c("E4_DIABETES", "COPD_COMORB")
-events <- endpoint_combination(events, endpoints)
-
-# read full exposure data, assign arguments and prepare relevant exposure data
-purchases <- read.csv("mock_doac_purchases.csv", header=TRUE)
-atc_codes <- data.frame(ATC_CODE = c("B01AF01", "B01AF02", "B01AE07"), DAILY_DOSE = c(1, 2, 2))
-vnr_info <- read.csv("vnr_info_combined.csv", header=TRUE)
-tolerance <- 14
-ignore_psize <- TRUE
-psize <- 100
-exposures <- exposure_combination(purchases, atc_codes, vnr_info, tolerance, ignore_psize, psize)
-
-
-# create single SCCS model
-age_groups <- 20
-hist(events$EVENT_AGE, breaks=quantile(events$EVENT_AGE, seq(0, 1, 1/age_groups)))
-exposure_periods <- c(-7, 0)
-include_unexposed <- TRUE
-first_event <- FALSE
-sccs.mod <- sccs_model(events, exposures, exposure_periods, age_groups,
-           include_unexposed, first_event)
-sccs.mod
-
-
-
-
-# create array of SCCS models
-
-# input list
-inputs <- expand.grid(exposure_periods=list(0, c(-7, 0), c(-14, 0), c(0, 7)),
-                      age_groups=c(10, 20, 30),
-                      include_unexposed=c(TRUE,FALSE),
-                      first_event=c(TRUE,FALSE))
-inputs
-
-# histograms with differing numbers of age groups
-par(mfrow=c(1, length(unique(inputs$age_groups))))
-for (n in unique(inputs$age_groups)) {
-  hist(events$EVENT_AGE, breaks=quantile(events$EVENT_AGE, seq(0, 1, 1/n)), main=paste(n, "groups"))
-}
-
-# results_mod: list of models
-# results_df: dataframe of inputs and relevant results
-results_mod <- pmap(.l=inputs, .f=sccs_model, events=events, exposures=exposures)
-
-results_df <- inputs
-results_df[c("exp(coef)", "lower95", "upper95", "p", "se")] <- NA
-for (row in 1:length(results_mod)) {
-  i.exp <- length(results_df[[row,1]]) # index of relevant exposure group, assumed to be the last one
-  results_df[row,5:9] <- with(results_mod[[row]], c(conf.int[i.exp,1], conf.int[i.exp,3],
-                            conf.int[i.exp,4], coefficients[i.exp,5], coefficients[i.exp,3]))
-}
-results_df
