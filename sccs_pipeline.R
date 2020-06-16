@@ -94,17 +94,17 @@ endpoint_combination <- function(events, endpoints) {
     # modify | separated endpoints to vector
     endpoints <- sep2vec(endpoints)
     
+    # filter events by "endpoints" vector
+    events <- events[events$ENDPOINT %in% endpoints,]
+    
     # calculate observation start age
     events$OBSERV_START_AGE <- events$FU_START_AGE
 
     # sort events by finngenid and event age
     events <- arrange(events, FINNGENID, EVENT_AGE)
-
-    # filter events by "endpoints" vector
-    events <- events[events$ENDPOINT %in% endpoints,]
     
     if (nrow(events)==0) {
-        print("Zero rows for endpoint ", endpoint, ", aborting")
+        print("Zero rows for endpoint ", endpoint, ", returning NA")
         return(NA)
     }
 
@@ -129,7 +129,7 @@ exposure_combination <- function(purchases, atc_codes, vnr_info,
     purchases <- filter(purchases, grepl(pattern, ATC_CODE))
     
     if (nrow(purchases)==0) {
-      print("Zero rows for ATCs ", pattern, ", aborting")
+      print("Zero rows for ATCs ", pattern, ", returning NA")
       return(NA)
     }
     
@@ -140,15 +140,26 @@ exposure_combination <- function(purchases, atc_codes, vnr_info,
       
       # check if all VNRs were found
       if (any(is.na(purchases$PKOKO))) {
+        missing_vnrs <- unique(purchases[is.na(purchases$PKOKO),]$VNRO)
         print("VNRs not found:")
-        print(unique(purchases[is.na(purchases$PKOKO),]$VNRO))
-        stop()
+        print(missing_vnrs)
+        print("Number of purchases with VNR:")
+        print(sum(purchases$VNRO %in% missing_vnrs))
+        print("for ATCs:")
+        print(pattern)
+        print("imputing PKOKO as 30")
       }
-      print(head(purchases))
+      purchases$PKOKO <- ifelse(is.na(purchases$PKOKO), 30, purchases$PKOKO)
+        
+        
+        
+      ## SKIP GETTING DDD from atc_codes, impute 1 as dose for all
       # calculate exposure duration and exposure end age using doses per day
-      purchases <- left_join(purchases, atc_codes, by="ATC_CODE")
+      #purchases <- left_join(purchases, atc_codes, by="ATC_CODE")
+      #purchases$EXPOSURE_END_AGE <- purchases$PURCHASE_AGE +
+      #  with(purchases, PLKM * PKOKO / 365 / DAILY_DOSE)
       purchases$EXPOSURE_END_AGE <- purchases$PURCHASE_AGE +
-        with(purchases, PLKM * PKOKO / 365 / DAILY_DOSE)
+        with(purchases, PLKM * PKOKO / 365 / 1)
       
       # otherwise, assume default package size
     } else {
@@ -220,7 +231,6 @@ sccs_model <- function(events, exposures, exposure_periods, age_groups,
   if (first_event) {
     events <- distinct(events, FINNGENID, .keep_all = TRUE)
   }
-    print(head(exposures))
   
   # combine event and exposure data
   # if an individual can have multiple events, all exposure episodes are repeated for each event
@@ -242,10 +252,6 @@ sccs_model <- function(events, exposures, exposure_periods, age_groups,
   # create equally populated age groups, number specified in age_groups
   ageq <- floor(quantile(data$EVENT_AGE[duplicated(data$FINNGENID)==0],
                        seq(1/age_groups, 1-1/age_groups, 1/age_groups),names=F))
-  print(head(data))
-    print(summary(data))
-    print(names(data))
-    print(object.size(data))
   # SCCS model fitting
   #ref1 <- round(age_groups/2) # for passing reference age to function
   sccs.mod <- standardsccs(event~PURCHASE_AGE+relevel(age, ref=5),
