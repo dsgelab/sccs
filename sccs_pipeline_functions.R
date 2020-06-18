@@ -33,6 +33,20 @@ endpoint_combination <- function(events, endpoints) {
 
 
 # exposure_combination returns exposures included in dataframe "atc_codes"
+# combined into predicted drug use episodes
+# Methods used for combination:
+# 1. Fixed time window
+# - necessary arguments: ignore_psize=TRUE, psize, tolerance
+# - unneeded arguments: vnr_info=NA, atc_codes$DAILY_DOSE=NA
+# - purchases are combined if the following one is made within fixed time (psize+tolerance)
+# - if no following purchase is made, assume fixed purchase length (psize)
+# 2. Fixed tablet count
+# - necessary arguments: ignore_psize=FALSE, vnr_info, tolerance
+# - unneeded arguments: psize=NA
+# - takes total number of tablets from vnr_info and assumes fixed number of tablets per day (DAILY_DOSE)
+# - purchases are combined if the following one is made within previous
+# purchase size (PLKM*PKOKO/DAILY_DOSE + tolerance)
+# - if no following purchase is made, assume previous purchase size (PLKM*PKOKO/DAILY_DOSE)
 # purchases    : data frame of all purchases (FINNGENID, ATC_CODE, VNRO, PLKM, PURCHASE_AGE)
 # atc_codes    : data frame of drugs to be studied (ATC_CODE, DAILY_DOSE)
 # vnr_info     : data frame of package information (VNRO, PKOKO)
@@ -130,7 +144,131 @@ exposure_combination <- function(purchases, atc_codes, vnr_info,
                                                                 PURCHASE_AGE, EXPOSURE_END_AGE))
     
     return(combined_purchases)
-  }
+}
+
+
+
+# exposure_combination2 is a more data-driven method of combining exposure periods
+# - predicted package duration is the average of packages in up to three previous purchases
+# - default_purchase is used instead of average for first purchase of episode
+# - for isolated purchases, the duration is the global average of the same VNR
+# - "tolerance" days are added to all comparisons but not end ages
+# purchases         : data frame of all purchases (FINNGENID, ATC_CODE, VNRO, PLKM, PURCHASE_AGE)
+# atc_codes         : vector of drugs to be studied (ATC_CODE)
+# default_purchase  : default exposure duration after a single purchase (in days)
+# tolerance         : time allowed between medication episodes that are to be considered one (in days) 
+exposure_combination2 <- function(purchases, atc_codes, default_purchase=100, tolerance=30) {
+    
+    # filter purchases by relevant atc codes
+    # returns all purchases with any of atc_codes$ATC_CODE at the beginning
+    pattern <- paste("^", paste(atc_codes, collapse="|^"), sep="")
+    purchases <- filter(purchases, grepl(pattern, ATC_CODE))
+    
+    # check if ATCs found
+    if (nrow(purchases)==0) {
+        print("Zero rows for ATCs ", pattern, ", returning NA")
+        return(NA)
+    }
+    
+    # sort purchases by finngenid and purchase age
+    purchases <- arrange(purchases, FINNGENID, PURCHASE_AGE)
+    
+    # initialize exposure end age and purchase number (how many purchases have been made on this episode)
+    purchases$EXPOSURE_END_AGE <- NA
+    purchases$PURCHASE_NUMBER <- 1
+    
+    # loop over purchases and calculate exposure end ages
+    for (row in 1:(nrow(purchases)-1)) {
+        
+        # for first purchase of episode:
+        if (purchases$PURCHASE_NUMBER[row] == 1) {
+            # if another purchase of same vnr will be made by same finngenid
+            # within default_purchase+tolerance days:
+            if (purchases$VNRO[row+1] == purchases$VNRO[row] &
+                purchases$FINNGENID[row+1] == purchases$FINNGENID[row] &
+                purchases$PURCHASE_AGE[row+1] < purchases$PURCHASE_AGE[row] +
+                (default_purchase + tolerance)/365) {
+                # combine purchase with the next one
+                # update exposure end age to match next purchase and update next purchase number
+                purchases$EXPOSURE_END_AGE[row] <- purchases$PURCHASE_AGE[row+1]
+                purchases$PURCHASE_NUMBER[row+1] <- 2
+                # if another purchase was not made, consider purchase isolated
+                # leave exposure end age to NA for now and move on
+            } else next
+            
+            # for second-to-nth purchases of episode:
+        } else {
+            # calculate the average of up to three of this episode's previous exposure durations (time per package)
+            avg_psize <- 0
+            no_packages <- 0
+            iterations <- min(purchases$PURCHASE_NUMBER[row] - 1, 3)
+            for (i in 1:iterations) { # update average up to 3 times
+                avg_psize <- with(purchases[row-i,], (avg_psize * no_packages +
+                                                          EXPOSURE_END_AGE - PURCHASE_AGE)
+                                  / (no_packages + PLKM))
+                no_packages <- no_packages + purchases$PLKM[row-i]
+            }
+            
+            # if another purchase of same vnr will be made by same finngenid
+            # within calculated average duration + tolerance:
+            if (purchases$VNRO[row+1] == purchases$VNRO[row] &
+                purchases$FINNGENID[row+1] == purchases$FINNGENID[row] &
+                purchases$PURCHASE_AGE[row+1] < purchases$PURCHASE_AGE[row] +
+                avg_psize * purchases$PLKM[row] + tolerance/365) {
+                # combine purchase with the next one
+                # update exposure end age to match next purchase and update next purchase number
+                purchases$EXPOSURE_END_AGE[row] <- purchases$PURCHASE_AGE[row+1]
+                purchases$PURCHASE_NUMBER[row+1] <- purchases$PURCHASE_NUMBER[row] + 1
+                
+                # if another purchase was not made, end episode
+            } else {
+                # calculate exposure end age using average duration
+                purchases$EXPOSURE_END_AGE[row] <- purchases$PURCHASE_AGE[row] + avg_psize * purchases$PLKM[row]
+                next
+            }
+        }
+    }
+    
+    # for each VNR, calculate global average package duration, ignoring NA
+    glavg_psize <- purchases %>%
+        group_by(ATC_CODE, VNRO) %>%
+        summarize(avg = mean((EXPOSURE_END_AGE - PURCHASE_AGE) / PLKM, na.rm=TRUE)) %>%
+        ungroup()
+    # check if averages look sensible
+    print("Average days per package:")
+    print(mutate(glavg_psize, avg=avg*365))
+    
+    # for isolated purchases, update exposure end age with the global average
+    # if the average does not exist, use "default_purchase"
+    purchases <- purchases %>%
+        left_join(select(glavg_psize, -ATC_CODE), by="VNRO") %>%
+        mutate(EXPOSURE_END_AGE = ifelse(!is.na(EXPOSURE_END_AGE),
+                                         PURCHASE_AGE + avg * PLKM,
+                                         PURCHASE_AGE + default_purchase/365))
+    
+    # from purchase numbers, create episode numbers (running integer, constant inside one drug use episode)
+    purchases$EPISODE[1] <- 1
+    for (row in 2:nrow(purchases)) {
+        purchases$EPISODE[row] <- ifelse(purchases$PURCHASE_NUMBER[row] == 1,
+                                         purchases$EPISODE[row-1] + 1,
+                                         purchases$EPISODE[row-1])
+    }
+    
+    # leave first purchase of episode
+    combined_purchases <- purchases %>% distinct(EPISODE, .keep_all = TRUE)
+    
+    # combined exposure end age <- end age of last exposure
+    combined_purchases$EXPOSURE_END_AGE <- purchases %>%
+        group_by(EPISODE) %>%
+        summarize(end = max(EXPOSURE_END_AGE)) %>%
+        pull(end)
+    
+    # leave relevant columns
+    combined_purchases <- subset(combined_purchases, select = c(FINNGENID, ATC_CODE, VNRO,
+                                                                PURCHASE_AGE, EXPOSURE_END_AGE))
+    
+    return(combined_purchases)
+}
 
 
 
@@ -179,3 +317,4 @@ sccs_model <- function(events, exposures, exposure_periods, age_groups,
                              expogrp=exposure_periods, agegrp=ageq, dataformat="stack", data=data)
   
   return(sccs.mod)
+}
