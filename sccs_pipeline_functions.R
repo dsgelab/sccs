@@ -192,11 +192,11 @@ exposure_combination2 <- function(purchases, atc_codes, default_purchase=100, to
                 # update exposure end age to match next purchase and update next purchase number
                 purchases$EXPOSURE_END_AGE[row] <- purchases$PURCHASE_AGE[row+1]
                 purchases$PURCHASE_NUMBER[row+1] <- 2
-                # if another purchase was not made, consider purchase isolated
-                # leave exposure end age to NA for now and move on
+            # if another purchase was not made, consider purchase isolated
+            # leave exposure end age to NA for now (will be updated later) and move on
             } else next
             
-            # for second-to-nth purchases of episode:
+        # for second-to-nth purchases of episode:
         } else {
             # calculate the average of up to three of this episode's previous exposure durations (time per package)
             avg_psize <- 0
@@ -220,7 +220,7 @@ exposure_combination2 <- function(purchases, atc_codes, default_purchase=100, to
                 purchases$EXPOSURE_END_AGE[row] <- purchases$PURCHASE_AGE[row+1]
                 purchases$PURCHASE_NUMBER[row+1] <- purchases$PURCHASE_NUMBER[row] + 1
                 
-                # if another purchase was not made, end episode
+            # if another purchase was not made, end episode
             } else {
                 # calculate exposure end age using average duration
                 purchases$EXPOSURE_END_AGE[row] <- purchases$PURCHASE_AGE[row] + avg_psize * purchases$PLKM[row]
@@ -230,28 +230,30 @@ exposure_combination2 <- function(purchases, atc_codes, default_purchase=100, to
     }
     
     # for each VNR, calculate global average package duration, ignoring NA
+    # also include the number of purchases per VNR and how many of them were isolated
     glavg_psize <- purchases %>%
         group_by(ATC_CODE, VNRO) %>%
-        summarize(avg = mean((EXPOSURE_END_AGE - PURCHASE_AGE) / PLKM, na.rm=TRUE)) %>%
+        summarize(avg_duration = mean((EXPOSURE_END_AGE - PURCHASE_AGE) / PLKM, na.rm=TRUE),
+                  purchase_count = n(),
+                  percent_isolated = sum(is.na(EXPOSURE_END_AGE))/n()*100) %>%
         ungroup()
     # check if averages look sensible
-    print("Average days per package:")
-    print(mutate(glavg_psize, avg=avg*365))
+    print(mutate(glavg_psize, avg_duration=avg_duration*365))
     
-    # for isolated purchases, update exposure end age with the global average
-    # if the average does not exist, use "default_purchase"
+    # for isolated purchases (EXPOSURE_END_AGE=NA), update exposure end age with the global average
+    # if the average does not exist (avg_duration=NaN), use "default_purchase"
     purchases <- purchases %>%
-        left_join(select(glavg_psize, -ATC_CODE), by="VNRO") %>%
-        mutate(EXPOSURE_END_AGE = ifelse(!is.na(EXPOSURE_END_AGE),
-                                         PURCHASE_AGE + avg * PLKM,
-                                         PURCHASE_AGE + default_purchase/365))
+        left_join(select(glavg_psize, c(VNRO, avg_duration)), by="VNRO") %>%
+        mutate(EXPOSURE_END_AGE = ifelse(is.na(EXPOSURE_END_AGE),
+                                         ifelse(!is.nan(avg_duration),
+                                                PURCHASE_AGE + avg_duration * PLKM,
+                                                PURCHASE_AGE + default_purchase/365),
+                                         EXPOSURE_END_AGE))
     
-    # from purchase numbers, create episode numbers (running integer, constant inside one drug use episode)
-    purchases$EPISODE[1] <- 1
-    for (row in 2:nrow(purchases)) {
-        purchases$EPISODE[row] <- ifelse(purchases$PURCHASE_NUMBER[row] == 1,
-                                         purchases$EPISODE[row-1] + 1,
-                                         purchases$EPISODE[row-1])
+    # from purchase numbers, create episode numbers (unique inside one drug use episode)
+    purchases$EPISODE <- 1:nrow(purchases)
+    for (row in which(purchases$PURCHASE_NUMBER != 1)) {
+        purchases$EPISODE[row] <- purchases$EPISODE[row-1]
     }
     
     # leave first purchase of episode
